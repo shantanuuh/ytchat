@@ -1,36 +1,28 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# 🎥 YouTubeChat
 
-## Getting Started
+**YouTubeChat** is an intelligent, RAG-powered conversational web application that allows users to seamlessly query, analyze, and chat with the core content of any YouTube video in real time. 
 
-First, run the development server:
+---
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
-```
+## ✨ Key Features
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+* **Instant Transcript Ingestion:** Automatically fetches and processes full-length transcripts from any target YouTube video link.
+* **Retrieval-Augmented Generation (RAG):** Employs vector embeddings and semantic search via ChromaDB to ground AI responses directly in the video's actual spoken content, minimizing hallucinations.
+* **Flexible AI Provider Integration:** Supports multiple state-of-the-art AI providers and models (including OpenAI and DeepSeek-R1) to handle deep analytical summaries and precise Q&A.
+* **Interactive Chat Interface:** A sleek, responsive user experience built with Next.js and Tailwind CSS featuring real-time conversational flows.
+* **Model Configuration Hub:** Allows users to easily configure parameters, switch AI providers, and manage custom API keys directly within the UI.
+* **Modern Glassmorphism UI:** Built with smooth transitions, responsive layouts, and automatic dark/light mode support.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+---
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## 🛠️ Tech Stack
 
-## Learn More
+* **Frontend & Framework:** Next.js (App Router), React, TypeScript
+* **Styling:** Tailwind CSS
+* **AI & RAG Pipeline:** Python, OpenAI Whisper / Embeddings, ChromaDB, custom AI integration providers
+* **Backend & Database:** Supabase, REST APIs, Webhooks
 
-To learn more about Next.js, take a look at the following resources:
+---
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+## 🚀 Live Demo & Repository
+* **GitHub Repository:** [github.com/shantanuuh/ytchat](https://github.com/shantanuuh/ytchat)
