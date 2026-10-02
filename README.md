@@ -23,6 +23,3 @@
 * **Backend & Database:** Supabase, REST APIs, Webhooks
 
 ---
-
-## 🚀 Live Demo & Repository
-* **GitHub Repository:** [github.com/shantanuuh/ytchat](https://github.com/shantanuuh/ytchat)
