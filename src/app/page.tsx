@@ -32,6 +32,9 @@ export default function Page() {
 
   const chatEndRef = useRef<HTMLDivElement>(null);
 
+  // Add these with your existing useState hooks
+  const [selectedProvider, setSelectedProvider] = useState('auto');
+  const [showApiKey, setShowApiKey] = useState(false);  
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, chatLoading]);
@@ -523,48 +526,125 @@ export default function Page() {
                 </div>
               </div>
 
-              {/* BYOK Section */}
-              <div className={`border rounded-2xl p-6 space-y-4 transition-colors ${
-                theme === 'dark' ? 'bg-neutral-900/40 border-neutral-700' : 'bg-white border-neutral-300 shadow-sm'
-              }`}>
-                <div>
-                  <h3 className={`text-sm font-semibold uppercase tracking-wider mb-1 ${theme === 'dark' ? 'text-white' : 'text-neutral-950'}`}>Use Your Own API Key (BYOK)</h3>
-                  <p className={`text-xs leading-relaxed ${theme === 'dark' ? 'text-neutral-300' : 'text-neutral-700'}`}>
-                    For better control over usage, limits, and model access, you can connect your own API key. Keys are handled securely on client-side routing and never stored on our servers.
-                  </p>
-                </div>
+              {/* BYOK Configuration Card */}
+<div className={`border rounded-2xl p-6 space-y-5 transition-colors ${
+  theme === 'dark' ? 'bg-neutral-900/40 border-neutral-700' : 'bg-white border-neutral-300 shadow-sm'
+}`}>
+  <div className="flex items-center justify-between">
+    <div>
+      <h3 className={`text-sm font-semibold uppercase tracking-wider mb-1 ${theme === 'dark' ? 'text-white' : 'text-neutral-950'}`}>
+        Bring Your Own Key (BYOK)
+      </h3>
+      <p className={`text-xs leading-relaxed ${theme === 'dark' ? 'text-neutral-300' : 'text-neutral-700'}`}>
+        Connect your preferred LLM provider key for higher rate limits and custom model routing. Keys stay in client memory and are never saved to our database.
+      </p>
+    </div>
+  </div>
 
-                <div className="space-y-3">
-                  <div className="flex gap-2">
-                    <input 
-                      type="password"
-                      value={userApiKey}
-                      onChange={(e) => handleKeyChange(e.target.value)}
-                      placeholder="Paste your API key..."
-                      className={`flex-1 border rounded-xl px-4 py-2.5 text-sm focus:outline-none transition-colors ${
-                        theme === 'dark'
-                          ? 'bg-neutral-950 border-neutral-700 text-white placeholder-neutral-500 focus:border-neutral-500'
-                          : 'bg-neutral-50 border-neutral-400 text-neutral-950 placeholder-neutral-500 focus:border-neutral-600'
-                      }`}
-                    />
-                    <button
-                      type="button"
-                      onClick={handleSaveApiKey}
-                      disabled={keyValidationStatus !== 'valid'}
-                      className={`px-4 py-2.5 rounded-xl text-sm font-medium disabled:opacity-40 cursor-pointer transition-colors shadow-sm ${
-                        theme === 'dark' ? 'bg-white text-neutral-950 hover:bg-neutral-200' : 'bg-neutral-900 text-white hover:bg-neutral-800'
-                      }`}
-                    >
-                      Save Key
-                    </button>
-                  </div>
-                  {validationMessage && (
-                    <div className={`text-xs ${keyValidationStatus === 'valid' ? 'text-emerald-600 font-medium' : keyValidationStatus === 'invalid' ? 'text-rose-600 font-medium' : 'text-neutral-500'}`}>
-                      {validationMessage}
-                    </div>
-                  )}
-                </div>
-              </div>
+  <div className="space-y-4">
+    {/* Provider Selector */}
+    <div className="flex flex-col sm:flex-row gap-3">
+      <div className="w-full sm:w-48">
+        <label className={`block text-[11px] font-medium uppercase tracking-wider mb-1.5 ${theme === 'dark' ? 'text-neutral-400' : 'text-neutral-600'}`}>
+          Provider
+        </label>
+        <select
+          value={selectedProvider}
+          onChange={(e) => setSelectedProvider(e.target.value)}
+          className={`w-full border rounded-xl px-3 py-2.5 text-sm focus:outline-none transition-colors ${
+            theme === 'dark'
+              ? 'bg-neutral-950 border-neutral-700 text-white'
+              : 'bg-neutral-50 border-neutral-400 text-neutral-950'
+          }`}
+        >
+          <option value="auto">Auto-Detect</option>
+          <option value="huggingface">Hugging Face</option>
+          <option value="groq">Groq</option>
+          <option value="openai">OpenAI</option>
+          <option value="mistral">Mistral AI</option>
+        </select>
+      </div>
+
+      {/* Key Input Field with Show/Hide Toggle */}
+      <div className="flex-1">
+        <label className={`block text-[11px] font-medium uppercase tracking-wider mb-1.5 ${theme === 'dark' ? 'text-neutral-400' : 'text-neutral-600'}`}>
+          API Key
+        </label>
+        <div className="relative flex items-center">
+          <input 
+            type={showApiKey ? 'text' : 'password'}
+            value={userApiKey}
+            onChange={(e) => handleKeyChange(e.target.value)}
+            placeholder="hf_... or gsk_... or sk-..."
+            className={`w-full border rounded-xl pl-4 pr-10 py-2.5 text-sm focus:outline-none transition-colors font-mono ${
+              theme === 'dark'
+                ? 'bg-neutral-950 border-neutral-700 text-white placeholder-neutral-600 focus:border-neutral-500'
+                : 'bg-neutral-50 border-neutral-400 text-neutral-950 placeholder-neutral-400 focus:border-neutral-600'
+            }`}
+          />
+          <button
+            type="button"
+            onClick={() => setShowApiKey(!showApiKey)}
+            className="absolute right-3 text-neutral-400 hover:text-white transition-colors text-xs"
+            title={showApiKey ? 'Hide Key' : 'Show Key'}
+          >
+            {showApiKey ? 'Hide' : 'Show'}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    {/* Validation Feedback & Action Buttons */}
+    <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 pt-2">
+      <div className="text-xs">
+        {keyValidationStatus === 'validating' && (
+          <span className="text-amber-500 flex items-center gap-1.5 font-medium">
+            <span className="w-2 h-2 rounded-full bg-amber-500 animate-ping"></span>
+            Verifying API credentials...
+          </span>
+        )}
+        {keyValidationStatus === 'valid' && (
+          <span className="text-emerald-500 font-medium">✓ {validationMessage}</span>
+        )}
+        {keyValidationStatus === 'invalid' && (
+          <span className="text-rose-500 font-medium">✕ {validationMessage}</span>
+        )}
+        {keyValidationStatus === 'idle' && (
+          <span className="text-neutral-500">Enter a key above to verify automatically.</span>
+        )}
+      </div>
+
+      <div className="flex items-center gap-2 w-full sm:w-auto">
+        {savedApiKey && (
+          <button
+            type="button"
+            onClick={() => {
+              setSavedApiKey('');
+              setUserApiKey('');
+              setKeyValidationStatus('idle');
+              setValidationMessage('');
+            }}
+            className={`px-3 py-2 rounded-xl text-xs font-medium border transition-colors cursor-pointer ${
+              theme === 'dark' ? 'border-neutral-700 text-neutral-300 hover:bg-neutral-800' : 'border-neutral-300 text-neutral-700 hover:bg-neutral-100'
+            }`}
+          >
+            Clear Saved Key
+          </button>
+        )}
+        <button
+          type="button"
+          onClick={handleSaveApiKey}
+          disabled={keyValidationStatus !== 'valid'}
+          className={`flex-1 sm:flex-none px-5 py-2 rounded-xl text-xs font-medium disabled:opacity-40 cursor-pointer transition-colors shadow-sm ${
+            theme === 'dark' ? 'bg-white text-neutral-950 hover:bg-neutral-200' : 'bg-neutral-900 text-white hover:bg-neutral-800'
+          }`}
+        >
+          {savedApiKey === userApiKey ? 'Key Saved' : 'Save Key'}
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
 
               {/* Copyright & Content Notice */}
               <div className={`border rounded-2xl p-6 space-y-2 transition-colors ${

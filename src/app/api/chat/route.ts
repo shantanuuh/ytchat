@@ -1,5 +1,14 @@
 import { NextResponse } from 'next/server';
 import { supabase } from '@/lib/supabase';
+import OpenAI from 'openai';
+
+interface MatchedChunk {
+  id?: number;
+  chunk_text: string;
+  similarity?: number;
+  start_ms?: number;
+  end_ms?: number;
+}
 
 export async function POST(request: Request) {
   try {
@@ -9,16 +18,27 @@ export async function POST(request: Request) {
     }
 
     const body = await request.json();
-    const { message, videoId, apiKey } = body;
-    
-    // Validate BYOK (Bring Your Own Key) or fallback to server env
-    const activeApiKey = apiKey?.trim() || process.env.HUGGINGFACE_API_KEY || process.env.HF_TOKEN;
+    const { message, videoId, apiKey, provider } = body;
 
-    console.log('Chat API Request received:', { videoId, messageLength: message?.length, hasCustomKey: !!apiKey });
+    const trimmedKey = typeof apiKey === 'string' ? apiKey.trim() : '';
+
+    // Detect if key is OpenAI
+    const isOpenAIKey = trimmedKey.startsWith('sk-') || trimmedKey.startsWith('sk-proj-');
+    const openAIKey = isOpenAIKey ? trimmedKey : process.env.OPENAI_API_KEY;
+
+    // Detect active inference key (BYOK key or env key)
+    const activeApiKey = 
+      trimmedKey || 
+      process.env.HUGGINGFACE_API_KEY || 
+      process.env.HF_TOKEN || 
+      process.env.GROQ_API_KEY ||
+      process.env.OPENAI_API_KEY;
+
+    console.log('Chat API Request received:', { videoId, messageLength: message?.length, hasCustomKey: !!trimmedKey });
 
     if (!activeApiKey) {
       return NextResponse.json({ 
-        error: 'Missing Hugging Face API Key. Please enter your API key in the BYOK settings or configure it in your environment variables.' 
+        error: 'Missing API Key. Please enter your API key in BYOK settings or configure it in server environment variables.' 
       }, { status: 400 });
     }
 
@@ -32,33 +52,85 @@ export async function POST(request: Request) {
     const isCasualChat = greetings.includes(cleanMessage) || cleanMessage.length <= 3;
 
     let transcriptContext = '';
-    
-    // Only fetch transcript chunks if it's an actual question/content query
-    if (!isCasualChat) {
-      const { data: records, error: dbError } = await supabase
-        .from('transcripts')
-        .select('chunk_text')
-        .eq('video_id', videoId);
+    let relevanceScore: number | null = null;
+    let matchedChunksCount = 0;
 
-      if (dbError) {
-        console.error('Supabase fetch error:', dbError);
-        return NextResponse.json({ error: `Database error: ${dbError.message}` }, { status: 500 });
+    // Retrieve transcript chunks only if it is an actual content query
+    if (!isCasualChat) {
+      let matchedChunks: MatchedChunk[] = [];
+
+      // 1. Attempt Vector Similarity Search if OpenAI API key is available
+      if (openAIKey) {
+        try {
+          const openai = new OpenAI({ apiKey: openAIKey });
+          const embRes = await openai.embeddings.create({
+            model: 'text-embedding-3-small',
+            input: message.replace(/\n/g, ' ').trim(),
+          });
+
+          const queryEmbedding = embRes.data[0].embedding;
+
+          // Call Postgres RPC match_video_transcripts
+          const { data: rpcMatches, error: rpcError } = await supabase.rpc('match_video_transcripts', {
+            query_embedding: queryEmbedding,
+            target_video_id: videoId,
+            match_threshold: 0.15,
+            match_count: 8,
+          });
+
+          if (!rpcError && Array.isArray(rpcMatches) && rpcMatches.length > 0) {
+            matchedChunks = rpcMatches;
+            const validSimilarities = rpcMatches
+              .map((m: any) => m.similarity)
+              .filter((s: any) => typeof s === 'number');
+            if (validSimilarities.length > 0) {
+              relevanceScore = parseFloat((validSimilarities.reduce((a: number, b: number) => a + b, 0) / validSimilarities.length).toFixed(3));
+            }
+            console.log(`Vector similarity search retrieved ${matchedChunks.length} chunks (Avg similarity: ${relevanceScore})`);
+          } else if (rpcError) {
+            console.warn('match_video_transcripts RPC call returned error, falling back to sequential fetch:', rpcError.message);
+          }
+        } catch (embErr) {
+          console.warn('Vector search attempt failed, falling back to standard fetch:', embErr);
+        }
       }
 
-      if (records && records.length > 0) {
-        transcriptContext = records.map((r) => r.chunk_text).join(' ');
-        console.log(`Successfully loaded ${records.length} transcript chunks for context.`);
+      // 2. Fallback: If vector search did not yield chunks, fetch transcript chunks sequentially
+      if (matchedChunks.length === 0) {
+        const { data: records, error: dbError } = await supabase
+          .from('transcripts')
+          .select('chunk_text')
+          .eq('video_id', videoId)
+          .order('chunk_index', { ascending: true })
+          .limit(20);
+
+        if (dbError) {
+          console.error('Supabase fetch error:', dbError);
+          return NextResponse.json({ error: `Database error: ${dbError.message}` }, { status: 500 });
+        }
+
+        if (records && records.length > 0) {
+          matchedChunks = records;
+          console.log(`Standard fetch loaded ${records.length} transcript chunks for context.`);
+        }
+      }
+
+      matchedChunksCount = matchedChunks.length;
+      if (matchedChunks.length > 0) {
+        transcriptContext = matchedChunks.map((r) => r.chunk_text).join('\n\n');
       }
     }
 
-    // Define smart system instructions with fallback behavior if context doesn't cover the query
+    // Define system instructions with timestamp citations and structured format
     const systemContent = transcriptContext 
-      ? `You are an expert AI video analyst assistant. Answer the user's question based strictly on the provided YouTube video transcript context below. 
+      ? `You are an expert AI video analyst assistant. Answer the user's question based strictly on the provided YouTube video transcript context below.
 
-IMPORTANT RULE: If the user's question asks about something completely unrelated to the transcript or if the transcript doesn't contain the answer, politely inform them: "I couldn't find information about that in the current video transcript. Please ask a question related to the video's contents!"
+IMPORTANT RULES:
+- When referencing facts, cite the timestamp from the context (e.g. [02:45]).
+- If the user's question asks about something completely unrelated to the transcript or if the transcript doesn't contain the answer, politely inform them: "I couldn't find information about that in the current video transcript. Please ask a question related to the video's contents!"
 
 Format your response cleanly using this exact structure when applicable:
-- Provide a brief introductory paragraph summarizing the core answer or explanation with relevant timestamps if available.
+- Provide a brief introductory paragraph summarizing the core answer with relevant timestamps.
 - Use bold headers for **Key Concepts** with brief bullet points.
 - Use bold headers for sub-categories (like **Types of ...**) if breaking down technical details.
 
@@ -66,73 +138,79 @@ Transcript Context:
 ${transcriptContext}`
       : `You are a friendly, helpful AI video companion assistant. Respond naturally and politely to the user's greeting, and let them know you're ready to answer questions about the currently loaded video!`;
 
-    // Call Hugging Face Router API
-    const response = await fetch('https://router.huggingface.co/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${activeApiKey}`,
-      },
-      body: JSON.stringify({
-        model: 'deepseek-ai/DeepSeek-R1-Distill-Qwen-7B',
+    // 3. Execute LLM Inference
+    // If the active key is an OpenAI key or Groq key, route appropriately, otherwise use Hugging Face router
+    let reply = '';
+
+    if (isOpenAIKey || (provider === 'openai' && trimmedKey)) {
+      // Call OpenAI API
+      const openai = new OpenAI({ apiKey: trimmedKey || process.env.OPENAI_API_KEY });
+      const completion = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
         messages: [
-          {
-            role: 'system',
-            content: systemContent
-          },
-          {
-            role: 'user',
-            content: message
-          }
+          { role: 'system', content: systemContent },
+          { role: 'user', content: message },
         ],
-        max_tokens: 2048, // Increased to accommodate reasoning tokens + output
         temperature: 0.3,
-      }),
-    });
+        max_tokens: 1500,
+      });
+      reply = completion.choices[0]?.message?.content || '';
+    } else {
+      // Default / Hugging Face Router API (DeepSeek-R1-Distill-Qwen-7B)
+      const hfKey = trimmedKey || process.env.HUGGINGFACE_API_KEY || process.env.HF_TOKEN || '';
+      const response = await fetch('https://router.huggingface.co/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${hfKey}`,
+        },
+        body: JSON.stringify({
+          model: 'deepseek-ai/DeepSeek-R1-Distill-Qwen-7B',
+          messages: [
+            { role: 'system', content: systemContent },
+            { role: 'user', content: message },
+          ],
+          max_tokens: 2048,
+          temperature: 0.3,
+        }),
+      });
 
-    const data = await response.json();
+      const data = await response.json();
 
-    if (!response.ok) {
-      console.error('Hugging Face Provider Error Response:', data);
-      
-      if (response.status === 401 || response.status === 403) {
-        return NextResponse.json({ 
-          error: 'Invalid Hugging Face API Key. Please check your BYOK key and try again.' 
-        }, { status: 401 });
+      if (!response.ok) {
+        console.error('LLM Provider Error Response:', data);
+        if (response.status === 401 || response.status === 403) {
+          return NextResponse.json({ 
+            error: 'Invalid API Key. Please verify your BYOK credentials and try again.' 
+          }, { status: 401 });
+        }
+        if (response.status === 503) {
+          return NextResponse.json({ 
+            error: 'The AI model is currently loading into serverless memory. Please wait 10 seconds and try again.' 
+          }, { status: 503 });
+        }
+        throw new Error(data.error?.message || data.error || 'Provider inference failed.');
       }
 
-      if (response.status === 503) {
-        return NextResponse.json({ 
-          error: 'The AI model is currently loading into serverless memory. Please wait 10 seconds and try again.' 
-        }, { status: 503 });
+      const choice = data.choices?.[0];
+      const rawReply = choice?.message?.content || choice?.text || '';
+
+      // Clean DeepSeek-R1 <think> reasoning tokens
+      reply = rawReply.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+      if (!reply) {
+        reply = rawReply.replace(/<\/?think>/g, '').trim();
       }
-
-      throw new Error(data.error?.message || data.error || 'Hugging Face provider inference failed.');
     }
 
-    // Robust extraction handling reasoning tokens and standard completions
-    const choice = data.choices?.[0];
-    let rawReply = choice?.message?.content || '';
-
-    if (!rawReply && choice?.text) {
-      rawReply = choice.text;
-    }
-
-    // CLEAN UP: Remove DeepSeek R1 <think>...</think> blocks so they don't leak into the UI
-    let reply = rawReply.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
-
-    if (!reply || reply === '') {
-      // Fallback if the whole output was somehow trapped inside think tags
-      reply = rawReply.replace(/<\/?think>/g, '').trim();
-    }
-
-    if (!reply || reply === '') {
-      reply = "I processed your request, but the model didn't return a text output. Please try rephrasing your question!";
+    if (!reply) {
+      reply = "I processed your request, but could not produce a response. Please try rephrasing your question!";
     }
 
     return NextResponse.json({
       success: true,
-      reply: reply
+      reply,
+      relevanceScore,
+      matchedChunksCount,
     });
 
   } catch (err: unknown) {
