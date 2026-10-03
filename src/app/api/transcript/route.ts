@@ -63,12 +63,13 @@ export async function POST(request: Request) {
       console.error('Error clearing old transcript chunks:', deleteError);
     }
 
-    // 2. Format rows: Prepend timestamps so the AI model knows *when* things happened in the video
-    const rowsToInsert = transcriptItems.map((item) => {
+    // 2. Format rows with timestamps and chunk_index to match table schema
+    const rowsToInsert = transcriptItems.map((item, index) => {
       const timeStr = formatTimestamp(item.offset || 0);
       return {
         video_id: videoId,
         chunk_text: `[${timeStr}] ${item.text}`,
+        chunk_index: index, // Included to match your Supabase schema
         updated_at: new Date().toISOString()
       };
     });
