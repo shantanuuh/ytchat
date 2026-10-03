@@ -30,7 +30,20 @@ interface TranscriptChunk {
   embedding?: number[];
 }
 
-// 1. Helper to extract YouTube Video ID from various URL formats
+// 1. Decode HTML entities
+function decodeEntities(str: string): string {
+  return str
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&apos;/g, "'")
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => String.fromCodePoint(parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_, dec) => String.fromCodePoint(parseInt(dec, 10)));
+}
+
+// 2. Helper to extract YouTube Video ID from any URL format
 export function extractYouTubeVideoId(url: string): string | null {
   if (!url) return null;
   const trimmed = url.trim();
@@ -42,7 +55,7 @@ export function extractYouTubeVideoId(url: string): string | null {
   return (match && match[1].length === 11) ? match[1] : null;
 }
 
-// 2. Format millisecond timestamp into [HH:MM:SS] or [MM:SS]
+// 3. Format millisecond timestamp into [HH:MM:SS] or [MM:SS]
 function formatTimestamp(ms: number): string {
   const totalSeconds = Math.max(0, Math.floor(ms / 1000));
   const hours = Math.floor(totalSeconds / 3600);
@@ -55,7 +68,7 @@ function formatTimestamp(ms: number): string {
   return `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
 }
 
-// 3. Select best caption track prioritizing human transcripts and multilingual codes (en, hi, mr)
+// 4. Select best caption track prioritizing human transcripts and multilingual codes (en, hi, mr)
 function selectBestTrack(tracks: CaptionTrack[], preferredLang?: string): CaptionTrack {
   if (preferredLang) {
     const directMatch = tracks.find((t) => t.languageCode.toLowerCase().startsWith(preferredLang.toLowerCase()));
@@ -76,8 +89,46 @@ function selectBestTrack(tracks: CaptionTrack[], preferredLang?: string): Captio
   return pool[0];
 }
 
-// 4. Fetch server-side caption track JSON (&fmt=json3) via YouTube InnerTube Android API
-async function fetchInnerTubeJson3(videoId: string, preferredLang?: string): Promise<{ events: Json3Event[]; language: string } | null> {
+// 5. Parse XML events as fallback when YouTube returns XML instead of JSON3
+function parseXmlEvents(xml: string): Json3Event[] {
+  const events: Json3Event[] = [];
+
+  // srv3 format: <p t="ms" d="ms">...</p>
+  const pRegex = /<p\s+t="(\d+)"\s+d="(\d+)"[^>]*>([\s\S]*?)<\/p>/g;
+  let match;
+  while ((match = pRegex.exec(xml)) !== null) {
+    const startMs = parseInt(match[1], 10);
+    const durMs = parseInt(match[2], 10);
+    const rawText = match[3].replace(/<[^>]+>/g, '').trim();
+    if (rawText) {
+      events.push({
+        tStartMs: startMs,
+        dDurationMs: durMs,
+        segs: [{ utf8: decodeEntities(rawText) }],
+      });
+    }
+  }
+  if (events.length > 0) return events;
+
+  // Classic format: <text start="s" dur="s">...</text>
+  const textRegex = /<text\s+start="([\d.]+)"\s+dur="([\d.]+)"[^>]*>([\s\S]*?)<\/text>/g;
+  while ((match = textRegex.exec(xml)) !== null) {
+    const startMs = Math.round(parseFloat(match[1]) * 1000);
+    const durMs = Math.round(parseFloat(match[2]) * 1000);
+    const rawText = match[3].replace(/<[^>]+>/g, '').trim();
+    if (rawText) {
+      events.push({
+        tStartMs: startMs,
+        dDurationMs: durMs,
+        segs: [{ utf8: decodeEntities(rawText) }],
+      });
+    }
+  }
+  return events;
+}
+
+// 6. Fetch caption track using YouTube InnerTube Android API with URL parameter normalization
+async function fetchInnerTubeCaptions(videoId: string, preferredLang?: string): Promise<{ events: Json3Event[]; language: string } | null> {
   const INNERTUBE_API_URL = 'https://www.youtube.com/youtubei/v1/player?prettyPrint=false';
   const INNERTUBE_CLIENT_VERSION = '20.10.38';
 
@@ -112,29 +163,53 @@ async function fetchInnerTubeJson3(videoId: string, preferredLang?: string): Pro
     }
 
     const selectedTrack = selectBestTrack(captionTracks, preferredLang);
-    const json3Url = selectedTrack.baseUrl.replace('&fmt=srv3', '') + '&fmt=json3';
+    
+    // Normalize URL parameters to request fmt=json3
+    let trackUrl: string;
+    try {
+      const urlObj = new URL(selectedTrack.baseUrl);
+      urlObj.searchParams.set('fmt', 'json3');
+      trackUrl = urlObj.toString();
+    } catch {
+      trackUrl = selectedTrack.baseUrl.replace('&fmt=srv3', '') + '&fmt=json3';
+    }
 
-    const trackResponse = await fetch(json3Url);
+    const trackResponse = await fetch(trackUrl);
     if (!trackResponse.ok) {
-      console.warn(`json3 track fetch failed with status ${trackResponse.status}`);
+      console.warn(`Caption track fetch failed with status ${trackResponse.status}`);
       return null;
     }
 
-    const json3Data = await trackResponse.json();
-    if (Array.isArray(json3Data?.events) && json3Data.events.length > 0) {
-      return {
-        events: json3Data.events,
-        language: selectedTrack.languageCode || 'unknown',
-      };
+    const responseText = await trackResponse.text();
+
+    // Attempt parsing as JSON3
+    try {
+      const json3Data = JSON.parse(responseText);
+      if (Array.isArray(json3Data?.events) && json3Data.events.length > 0) {
+        return {
+          events: json3Data.events,
+          language: selectedTrack.languageCode || 'unknown',
+        };
+      }
+    } catch {
+      // Fallback: parse as XML (timedtext or srv3)
+      const xmlEvents = parseXmlEvents(responseText);
+      if (xmlEvents.length > 0) {
+        return {
+          events: xmlEvents,
+          language: selectedTrack.languageCode || 'unknown',
+        };
+      }
     }
+
     return null;
   } catch (err) {
-    console.warn('InnerTube JSON3 retrieval error:', err);
+    console.warn('InnerTube caption retrieval error:', err);
     return null;
   }
 }
 
-// 5. Multilingual semantic chunker supporting Devanagari (Hindi/Marathi: । ॥) and Latin (. ! ?)
+// 7. Multilingual semantic chunker supporting Devanagari (Hindi/Marathi: । ॥) and Latin (. ! ?)
 function chunkTranscriptEvents(events: Json3Event[], targetChunkChars = 800): TranscriptChunk[] {
   const chunks: TranscriptChunk[] = [];
   let currentText = '';
@@ -193,7 +268,7 @@ function chunkTranscriptEvents(events: Json3Event[], targetChunkChars = 800): Tr
   return chunks;
 }
 
-// 6. Fallback chunker for legacy youtube-transcript items
+// 8. Fallback chunker for legacy youtube-transcript items
 function chunkLegacyTranscriptItems(items: { text: string; offset?: number; duration?: number }[], targetChunkChars = 800): TranscriptChunk[] {
   const events: Json3Event[] = items.map((item) => ({
     tStartMs: Math.round(item.offset || 0),
@@ -212,35 +287,36 @@ export async function POST(request: Request) {
     const body = await request.json();
     const { videoUrl, apiKey, lang } = body;
 
-    if (!videoUrl) {
-      return NextResponse.json({ error: 'Missing videoUrl in request.' }, { status: 400 });
+    if (!videoUrl || typeof videoUrl !== 'string' || !videoUrl.trim()) {
+      return NextResponse.json({ error: 'Please enter a YouTube video URL.' }, { status: 400 });
     }
 
     const videoId = extractYouTubeVideoId(videoUrl);
     if (!videoId) {
-      return NextResponse.json({ error: 'Invalid YouTube URL provided.' }, { status: 400 });
+      return NextResponse.json({ 
+        error: 'Invalid YouTube URL. Please provide a valid video link (e.g., https://www.youtube.com/watch?v=... or https://youtu.be/...)' 
+      }, { status: 400 });
     }
 
     console.log(`Processing transcript ingestion for video ID: ${videoId}`);
 
-    // Resolve OpenAI API Key: check BYOK header/body or server environment
-    const activeOpenAIKey = 
-      (typeof apiKey === 'string' && (apiKey.startsWith('sk-') || apiKey.startsWith('sk-proj-')) ? apiKey.trim() : null) ||
-      process.env.OPENAI_API_KEY;
+    // Resolve OpenAI API Key: check BYOK header/body (sk-...) or server environment
+    const isExplicitOpenAIKey = typeof apiKey === 'string' && (apiKey.startsWith('sk-') || apiKey.startsWith('sk-proj-'));
+    const activeOpenAIKey = isExplicitOpenAIKey ? apiKey.trim() : process.env.OPENAI_API_KEY;
 
     // 1. Fetch transcript events using YouTube InnerTube & fmt=json3
     let chunks: TranscriptChunk[] = [];
     let detectedLang = 'en';
 
-    const innerTubeResult = await fetchInnerTubeJson3(videoId, lang);
+    const innerTubeResult = await fetchInnerTubeCaptions(videoId, lang);
 
     if (innerTubeResult && innerTubeResult.events.length > 0) {
       detectedLang = innerTubeResult.language;
       chunks = chunkTranscriptEvents(innerTubeResult.events, 800);
-      console.log(`Extracted ${chunks.length} chunks via InnerTube json3 (Lang: ${detectedLang})`);
+      console.log(`Extracted ${chunks.length} chunks via InnerTube (Lang: ${detectedLang})`);
     } else {
       // Fallback to youtube-transcript library
-      console.log('InnerTube json3 unavailable, attempting youtube-transcript fallback...');
+      console.log('InnerTube captions unavailable, attempting youtube-transcript fallback...');
       try {
         const fallbackItems = await YoutubeTranscript.fetchTranscript(videoId, { lang });
         if (fallbackItems && fallbackItems.length > 0) {
@@ -257,11 +333,14 @@ export async function POST(request: Request) {
     }
 
     if (chunks.length === 0) {
-      return NextResponse.json({ error: 'Retrieved transcript contains no readable text.' }, { status: 400 });
+      return NextResponse.json({ 
+        error: 'Retrieved transcript contains no readable text.' 
+      }, { status: 400 });
     }
 
-    // 2. Generate Vector Embeddings using OpenAI text-embedding-3-small
+    // 2. Generate Vector Embeddings using OpenAI text-embedding-3-small (with fault-tolerant fallback)
     let embeddingsGenerated = false;
+    let embeddingWarning: string | null = null;
 
     if (activeOpenAIKey) {
       console.log(`Generating OpenAI text-embedding-3-small embeddings for ${chunks.length} chunks...`);
@@ -286,14 +365,13 @@ export async function POST(request: Request) {
         console.log(`Successfully generated vector embeddings for all ${chunks.length} chunks.`);
       } catch (embErr: unknown) {
         const msg = embErr instanceof Error ? embErr.message : 'OpenAI embedding generation failed';
-        console.error('Embedding error:', msg);
-        // If an explicit key was supplied and failed, notify user
-        if (apiKey) {
-          return NextResponse.json({ error: `OpenAI embedding generation failed: ${msg}` }, { status: 400 });
-        }
+        console.warn('OpenAI embedding generation warning:', msg);
+        embeddingWarning = msg;
+        // Notice: We do NOT abort with 400 here!
+        // We still save the transcript chunks into Supabase so the user can immediately chat with the video!
       }
     } else {
-      console.warn('No OpenAI API Key found. Chunks will be stored without vector embeddings until an OpenAI key is configured.');
+      console.log('No OpenAI API Key found. Chunks will be indexed with standard context mode.');
     }
 
     // 3. Clear existing chunks for this video ID to prevent duplication
@@ -307,7 +385,6 @@ export async function POST(request: Request) {
     }
 
     // 4. Bulk insert chunks into Supabase table ('transcripts')
-    // Attempt insert with new schema (start_ms, end_ms, embedding)
     const rowsWithTimestamps = chunks.map((c) => ({
       video_id: videoId,
       chunk_index: c.chunk_index,
@@ -331,7 +408,7 @@ export async function POST(request: Request) {
     }
 
     // Graceful backward compatibility fallback:
-    // If the database schema does not have start_ms or end_ms columns yet, insert legacy format
+    // If the database schema does not have start_ms or end_ms columns yet, insert baseline schema
     if (insertError && (insertError.message?.includes('start_ms') || insertError.message?.includes('end_ms'))) {
       console.warn('start_ms / end_ms columns not detected in Supabase. Inserting with baseline schema...');
       const fallbackRows = chunks.map((c) => ({
@@ -363,9 +440,12 @@ export async function POST(request: Request) {
       language: detectedLang,
       chunkCount: chunks.length,
       hasEmbeddings: embeddingsGenerated,
+      warning: embeddingWarning || undefined,
       message: embeddingsGenerated
         ? `Successfully parsed and indexed ${chunks.length} chunks with vector embeddings (text-embedding-3-small).`
-        : `Successfully parsed and stored ${chunks.length} chunks. (Add an OpenAI key to enable vector similarity search).`,
+        : embeddingWarning
+          ? `Indexed ${chunks.length} chunks successfully. (Vector embeddings skipped: ${embeddingWarning})`
+          : `Successfully indexed ${chunks.length} chunks. Ready for chat!`,
     });
 
   } catch (err: unknown) {
