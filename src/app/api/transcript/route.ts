@@ -30,6 +30,9 @@ interface TranscriptChunk {
   embedding?: number[];
 }
 
+const MODERN_BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+const ANDROID_UA = 'com.google.android.youtube/20.10.38 (Linux; U; Android 14)';
+
 // 1. Decode HTML entities
 function decodeEntities(str: string): string {
   return str
@@ -89,11 +92,11 @@ function selectBestTrack(tracks: CaptionTrack[], preferredLang?: string): Captio
   return pool[0];
 }
 
-// 5. Parse XML events as fallback when YouTube returns XML instead of JSON3
+// 5. Parse XML events (supports srv3 <p t="ms" d="ms"> and classic <text start="s" dur="s">)
 function parseXmlEvents(xml: string): Json3Event[] {
   const events: Json3Event[] = [];
 
-  // srv3 format: <p t="ms" d="ms">...</p>
+  // Format A: <p t="ms" d="ms">...<s>words</s>...</p>
   const pRegex = /<p\s+t="(\d+)"\s+d="(\d+)"[^>]*>([\s\S]*?)<\/p>/g;
   let match;
   while ((match = pRegex.exec(xml)) !== null) {
@@ -110,7 +113,7 @@ function parseXmlEvents(xml: string): Json3Event[] {
   }
   if (events.length > 0) return events;
 
-  // Classic format: <text start="s" dur="s">...</text>
+  // Format B: <text start="s" dur="s">content</text>
   const textRegex = /<text\s+start="([\d.]+)"\s+dur="([\d.]+)"[^>]*>([\s\S]*?)<\/text>/g;
   while ((match = textRegex.exec(xml)) !== null) {
     const startMs = Math.round(parseFloat(match[1]) * 1000);
@@ -127,8 +130,57 @@ function parseXmlEvents(xml: string): Json3Event[] {
   return events;
 }
 
-// 6. Fetch caption track using YouTube InnerTube Android API with URL parameter normalization
-async function fetchInnerTubeCaptions(videoId: string, preferredLang?: string): Promise<{ events: Json3Event[]; language: string } | null> {
+// 6. Fetch caption content from a given track baseUrl with automatic fallback between json3 and xml
+async function fetchCaptionTrackContent(baseUrl: string, trace: string[]): Promise<Json3Event[] | null> {
+  const attempts = [
+    { url: baseUrl, headers: { 'User-Agent': ANDROID_UA }, desc: 'Original baseUrl with Android UA' },
+    { url: baseUrl, headers: { 'User-Agent': MODERN_BROWSER_UA }, desc: 'Original baseUrl with Browser UA' },
+  ];
+
+  try {
+    const urlObj = new URL(baseUrl);
+    urlObj.searchParams.set('fmt', 'json3');
+    attempts.unshift({ url: urlObj.toString(), headers: { 'User-Agent': ANDROID_UA }, desc: 'fmt=json3 with Android UA' });
+  } catch {
+    // Ignore URL parse error
+  }
+
+  for (const attempt of attempts) {
+    try {
+      const resp = await fetch(attempt.url, { headers: attempt.headers });
+      trace.push(`${attempt.desc}: status ${resp.status}`);
+      if (!resp.ok) continue;
+
+      const text = await resp.text();
+      if (!text || text.trim().length === 0) continue;
+
+      // 1. Try parsing as JSON3
+      try {
+        const json = JSON.parse(text);
+        if (Array.isArray(json?.events) && json.events.length > 0) {
+          trace.push(`Parsed ${json.events.length} JSON3 events successfully`);
+          return json.events;
+        }
+      } catch {
+        // Not valid JSON, continue to XML parse
+      }
+
+      // 2. Try parsing as XML
+      const xmlEvents = parseXmlEvents(text);
+      if (xmlEvents.length > 0) {
+        trace.push(`Parsed ${xmlEvents.length} XML events successfully`);
+        return xmlEvents;
+      }
+    } catch (err: any) {
+      trace.push(`${attempt.desc} failed: ${err.message}`);
+    }
+  }
+
+  return null;
+}
+
+// 7. Method 1: Fetch via YouTube InnerTube API (Android client)
+async function fetchInnerTubeCaptions(videoId: string, preferredLang: string | undefined, trace: string[]): Promise<{ events: Json3Event[]; language: string } | null> {
   const INNERTUBE_API_URL = 'https://www.youtube.com/youtubei/v1/player?prettyPrint=false';
   const INNERTUBE_CLIENT_VERSION = '20.10.38';
 
@@ -137,79 +189,89 @@ async function fetchInnerTubeCaptions(videoId: string, preferredLang?: string): 
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'User-Agent': `com.google.android.youtube/${INNERTUBE_CLIENT_VERSION} (Linux; U; Android 14)`,
+        'User-Agent': ANDROID_UA,
       },
       body: JSON.stringify({
         context: {
           client: {
             clientName: 'ANDROID',
             clientVersion: INNERTUBE_CLIENT_VERSION,
+            hl: 'en',
+            gl: 'US',
           },
         },
         videoId,
       }),
     });
 
-    if (!resp.ok) {
-      console.warn(`InnerTube player request returned status ${resp.status}`);
-      return null;
-    }
+    trace.push(`InnerTube player HTTP status: ${resp.status}`);
+    if (!resp.ok) return null;
 
     const data = await resp.json();
     const captionTracks = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks as CaptionTrack[] | undefined;
 
     if (!captionTracks || captionTracks.length === 0) {
+      trace.push(`InnerTube: no caption tracks in response (status: ${data?.playabilityStatus?.status || 'unknown'})`);
       return null;
     }
 
+    trace.push(`InnerTube: found ${captionTracks.length} caption tracks (${captionTracks.map((t) => t.languageCode).join(', ')})`);
     const selectedTrack = selectBestTrack(captionTracks, preferredLang);
-    
-    // Normalize URL parameters to request fmt=json3
-    let trackUrl: string;
-    try {
-      const urlObj = new URL(selectedTrack.baseUrl);
-      urlObj.searchParams.set('fmt', 'json3');
-      trackUrl = urlObj.toString();
-    } catch {
-      trackUrl = selectedTrack.baseUrl.replace('&fmt=srv3', '') + '&fmt=json3';
+    trace.push(`Selected track: ${selectedTrack.languageCode} (${selectedTrack.kind || 'manual'})`);
+
+    const events = await fetchCaptionTrackContent(selectedTrack.baseUrl, trace);
+    if (events && events.length > 0) {
+      return { events, language: selectedTrack.languageCode || 'unknown' };
     }
-
-    const trackResponse = await fetch(trackUrl);
-    if (!trackResponse.ok) {
-      console.warn(`Caption track fetch failed with status ${trackResponse.status}`);
-      return null;
-    }
-
-    const responseText = await trackResponse.text();
-
-    // Attempt parsing as JSON3
-    try {
-      const json3Data = JSON.parse(responseText);
-      if (Array.isArray(json3Data?.events) && json3Data.events.length > 0) {
-        return {
-          events: json3Data.events,
-          language: selectedTrack.languageCode || 'unknown',
-        };
-      }
-    } catch {
-      // Fallback: parse as XML (timedtext or srv3)
-      const xmlEvents = parseXmlEvents(responseText);
-      if (xmlEvents.length > 0) {
-        return {
-          events: xmlEvents,
-          language: selectedTrack.languageCode || 'unknown',
-        };
-      }
-    }
-
     return null;
-  } catch (err) {
-    console.warn('InnerTube caption retrieval error:', err);
+  } catch (err: any) {
+    trace.push(`InnerTube exception: ${err.message}`);
     return null;
   }
 }
 
-// 7. Multilingual semantic chunker supporting Devanagari (Hindi/Marathi: । ॥) and Latin (. ! ?)
+// 8. Method 2: Fetch via Web Page HTML scraping
+async function fetchWebPageCaptions(videoId: string, preferredLang: string | undefined, trace: string[]): Promise<{ events: Json3Event[]; language: string } | null> {
+  try {
+    const watchUrl = `https://www.youtube.com/watch?v=${videoId}`;
+    const pageResp = await fetch(watchUrl, {
+      headers: {
+        'User-Agent': MODERN_BROWSER_UA,
+        'Accept-Language': 'en-US,en;q=0.9,hi;q=0.8,mr;q=0.7',
+      },
+    });
+
+    trace.push(`WebPage HTTP status: ${pageResp.status}`);
+    if (!pageResp.ok) return null;
+
+    const html = await pageResp.text();
+    const captionMatch = html.match(/"captionTracks":\s*(\[.*?\])/);
+    if (!captionMatch) {
+      trace.push('WebPage: captionTracks regex not matched');
+      return null;
+    }
+
+    const captionTracks: CaptionTrack[] = JSON.parse(captionMatch[1]);
+    if (!Array.isArray(captionTracks) || captionTracks.length === 0) {
+      trace.push('WebPage: captionTracks array empty');
+      return null;
+    }
+
+    trace.push(`WebPage: found ${captionTracks.length} caption tracks (${captionTracks.map((t) => t.languageCode).join(', ')})`);
+    const selectedTrack = selectBestTrack(captionTracks, preferredLang);
+
+    const events = await fetchCaptionTrackContent(selectedTrack.baseUrl, trace);
+    if (events && events.length > 0) {
+      return { events, language: selectedTrack.languageCode || 'unknown' };
+    }
+    return null;
+  } catch (err: any) {
+    trace.push(`WebPage exception: ${err.message}`);
+    return null;
+  }
+}
+
+// 9. Multilingual semantic chunker supporting Devanagari (Hindi/Marathi: । ॥) and Latin (. ! ?)
 function chunkTranscriptEvents(events: Json3Event[], targetChunkChars = 800): TranscriptChunk[] {
   const chunks: TranscriptChunk[] = [];
   let currentText = '';
@@ -268,7 +330,7 @@ function chunkTranscriptEvents(events: Json3Event[], targetChunkChars = 800): Tr
   return chunks;
 }
 
-// 8. Fallback chunker for legacy youtube-transcript items
+// 10. Fallback chunker for legacy youtube-transcript items
 function chunkLegacyTranscriptItems(items: { text: string; offset?: number; duration?: number }[], targetChunkChars = 800): TranscriptChunk[] {
   const events: Json3Event[] = items.map((item) => ({
     tStartMs: Math.round(item.offset || 0),
@@ -304,37 +366,49 @@ export async function POST(request: Request) {
     const isExplicitOpenAIKey = typeof apiKey === 'string' && (apiKey.startsWith('sk-') || apiKey.startsWith('sk-proj-'));
     const activeOpenAIKey = isExplicitOpenAIKey ? apiKey.trim() : process.env.OPENAI_API_KEY;
 
-    // 1. Fetch transcript events using YouTube InnerTube & fmt=json3
     let chunks: TranscriptChunk[] = [];
     let detectedLang = 'en';
+    const trace: string[] = [];
 
-    const innerTubeResult = await fetchInnerTubeCaptions(videoId, lang);
-
+    // 1. Method 1: YouTube InnerTube API
+    const innerTubeResult = await fetchInnerTubeCaptions(videoId, lang, trace);
     if (innerTubeResult && innerTubeResult.events.length > 0) {
       detectedLang = innerTubeResult.language;
       chunks = chunkTranscriptEvents(innerTubeResult.events, 800);
-      console.log(`Extracted ${chunks.length} chunks via InnerTube (Lang: ${detectedLang})`);
-    } else {
-      // Fallback to youtube-transcript library
-      console.log('InnerTube captions unavailable, attempting youtube-transcript fallback...');
+      trace.push(`InnerTube successfully parsed ${chunks.length} chunks`);
+    }
+
+    // 2. Method 2: Web Page HTML scraping fallback
+    if (chunks.length === 0) {
+      trace.push('InnerTube produced no chunks, trying WebPage scraping...');
+      const webPageResult = await fetchWebPageCaptions(videoId, lang, trace);
+      if (webPageResult && webPageResult.events.length > 0) {
+        detectedLang = webPageResult.language;
+        chunks = chunkTranscriptEvents(webPageResult.events, 800);
+        trace.push(`WebPage scraping successfully parsed ${chunks.length} chunks`);
+      }
+    }
+
+    // 3. Method 3: youtube-transcript library fallback
+    if (chunks.length === 0) {
+      trace.push('WebPage produced no chunks, trying youtube-transcript library fallback...');
       try {
-        const fallbackItems = await YoutubeTranscript.fetchTranscript(videoId, { lang });
+        const fallbackItems = await YoutubeTranscript.fetchTranscript(videoId);
         if (fallbackItems && fallbackItems.length > 0) {
           chunks = chunkLegacyTranscriptItems(fallbackItems, 800);
           detectedLang = fallbackItems[0].lang || 'en';
-          console.log(`Extracted ${chunks.length} chunks via fallback parser.`);
+          trace.push(`youtube-transcript successfully parsed ${chunks.length} chunks`);
         }
-      } catch (fallbackErr) {
-        console.error('All transcript extraction methods failed:', fallbackErr);
-        return NextResponse.json({
-          error: 'Could not retrieve captions for this YouTube video. It may be private, live, or have captions disabled.',
-        }, { status: 400 });
+      } catch (fallbackErr: any) {
+        trace.push(`youtube-transcript failed: ${fallbackErr.message}`);
       }
     }
 
     if (chunks.length === 0) {
+      console.warn('All extraction methods failed for video ID:', videoId, trace);
       return NextResponse.json({ 
-        error: 'Retrieved transcript contains no readable text.' 
+        error: `Could not retrieve captions for this YouTube video. It may be private, live, or have captions disabled. (Trace: ${trace.join(' | ')})`,
+        trace,
       }, { status: 400 });
     }
 
@@ -367,8 +441,6 @@ export async function POST(request: Request) {
         const msg = embErr instanceof Error ? embErr.message : 'OpenAI embedding generation failed';
         console.warn('OpenAI embedding generation warning:', msg);
         embeddingWarning = msg;
-        // Notice: We do NOT abort with 400 here!
-        // We still save the transcript chunks into Supabase so the user can immediately chat with the video!
       }
     } else {
       console.log('No OpenAI API Key found. Chunks will be indexed with standard context mode.');
@@ -445,7 +517,7 @@ export async function POST(request: Request) {
         ? `Successfully parsed and indexed ${chunks.length} chunks with vector embeddings (text-embedding-3-small).`
         : embeddingWarning
           ? `Indexed ${chunks.length} chunks successfully. (Vector embeddings skipped: ${embeddingWarning})`
-          : `Successfully indexed ${chunks.length} chunks. Ready for chat!`,
+          : `Successfully indexed ${chunks.length} chunks (${detectedLang.toUpperCase()}). Ready for chat!`,
     });
 
   } catch (err: unknown) {
