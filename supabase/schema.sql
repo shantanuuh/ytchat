@@ -1,8 +1,7 @@
 -- ==============================================================================
 -- ytchat: Production Supabase Schema Migration for Vector RAG
 -- ==============================================================================
--- This script:
--- 1. Enables the pgvector extension.
+-- 1. Enable the pgvector extension.
 -- 2. Adds start_ms and end_ms columns to the transcripts table.
 -- 3. Ensures the embedding column is typed as vector(1536) for text-embedding-3-small.
 -- 4. Replaces legacy ivfflat index with an HNSW index for high-recall vector search.
@@ -11,7 +10,7 @@
 -- ==============================================================================
 
 -- 1. Enable pgvector extension
-CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA extensions;
+CREATE EXTENSION IF NOT EXISTS vector;
 
 -- 2. Ensure transcripts table exists with required columns
 CREATE TABLE IF NOT EXISTS public.transcripts (
@@ -21,11 +20,11 @@ CREATE TABLE IF NOT EXISTS public.transcripts (
   start_ms integer NOT NULL DEFAULT 0,
   end_ms integer NOT NULL DEFAULT 0,
   chunk_text text NOT NULL,
-  embedding extensions.vector(1536) NULL,
+  embedding vector(1536) NULL,
   updated_at timestamp with time zone NOT NULL DEFAULT timezone('utc'::text, now())
 );
 
--- In case table already existed, ensure new columns exist:
+-- In case table already exists, ensure new columns are added:
 ALTER TABLE public.transcripts 
   ADD COLUMN IF NOT EXISTS start_ms integer NOT NULL DEFAULT 0;
 
@@ -36,17 +35,9 @@ ALTER TABLE public.transcripts
   ADD COLUMN IF NOT EXISTS chunk_index integer NULL;
 
 -- 3. Update embedding column to vector(1536)
--- Note: NULL values automatically cast to vector(1536)
-DO $$
-BEGIN
-  ALTER TABLE public.transcripts 
-    ALTER COLUMN embedding TYPE extensions.vector(1536);
-EXCEPTION
-  WHEN OTHERS THEN
-    -- Fallback for older pgvector installations without schema qualifier
-    ALTER TABLE public.transcripts 
-      ALTER COLUMN embedding TYPE vector(1536);
-END $$;
+-- NULL values automatically cast to vector(1536)
+ALTER TABLE public.transcripts 
+  ALTER COLUMN embedding TYPE vector(1536);
 
 -- 4. B-Tree Index on video_id for fast video partition queries
 CREATE INDEX IF NOT EXISTS transcripts_video_id_idx 
@@ -56,16 +47,16 @@ ON public.transcripts (video_id);
 DROP INDEX IF EXISTS public.transcripts_embedding_idx;
 
 -- 6. Create HNSW vector index using cosine distance (vector_cosine_ops)
--- HNSW offers superior recall (>95%) and scales seamlessly with dynamic inserts
+-- Do NOT prefix operator class with schema name (PostgreSQL syntax requirement)
 CREATE INDEX IF NOT EXISTS transcripts_embedding_hnsw_idx 
 ON public.transcripts 
-USING hnsw (embedding extensions.vector_cosine_ops) 
+USING hnsw (embedding vector_cosine_ops) 
 WITH (m = 16, ef_construction = 64);
 
 -- 7. Optimized RPC Function: match_video_transcripts
 -- Performs video-scoped cosine similarity search (<=>)
 CREATE OR REPLACE FUNCTION public.match_video_transcripts(
-  query_embedding extensions.vector(1536),
+  query_embedding vector(1536),
   target_video_id text,
   match_threshold double precision DEFAULT 0.20,
   match_count integer DEFAULT 6
@@ -103,7 +94,7 @@ $$;
 
 -- 8. Backward-compatible global match_chunks RPC function
 CREATE OR REPLACE FUNCTION public.match_chunks(
-  query_embedding extensions.vector(1536),
+  query_embedding vector(1536),
   match_threshold double precision DEFAULT 0.20,
   match_count integer DEFAULT 6
 )
