@@ -1,4 +1,3 @@
-// src/app/api/transcript/route.ts
 import { NextResponse } from 'next/server';
 import { supabase } from '@/lib/supabase';
 import { YoutubeTranscript } from 'youtube-transcript';
@@ -158,7 +157,7 @@ async function fetchCaptionFile(baseUrl: string): Promise<Json3Event[] | null> {
   return null;
 }
 
-// 8. Fetch via InnerTube (Supports embedded TVHTML5, Android, and Web clients with Cookie support)
+// 8. Fetch via InnerTube (Supports WEB_EMBEDDED_PLAYER, TVHTML5, Android, and Web clients with Cookie support)
 async function fetchViaInnerTube(
   videoId: string,
   preferredLang: string | undefined,
@@ -169,6 +168,7 @@ async function fetchViaInnerTube(
     trace.push(`visitorData: ${visitorData ? 'obtained' : 'unavailable'}`);
 
     const clients = [
+      { clientName: 'WEB_EMBEDDED_PLAYER', clientVersion: '5.20240308.00.00', ua: BROWSER_UA },
       { clientName: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER', clientVersion: '2.0', ua: BROWSER_UA },
       { clientName: 'ANDROID', clientVersion: '20.10.38', ua: ANDROID_UA },
       { clientName: 'WEB', clientVersion: '2.20240308.00.00', ua: BROWSER_UA },
@@ -187,7 +187,7 @@ async function fetchViaInnerTube(
           client: {
             clientName: client.clientName,
             clientVersion: client.clientVersion,
-            hl: 'en',
+            hl: preferredLang || 'en',
             gl: 'US',
             ...(visitorData ? { visitorData } : {}),
           },
@@ -218,7 +218,7 @@ async function fetchViaInnerTube(
   }
 }
 
-// 9. Fetch via WebPage HTML match
+// 9. Fetch via WebPage HTML match (ytInitialPlayerResponse + regex fallback)
 async function fetchViaWebPage(
   videoId: string,
   preferredLang: string | undefined,
@@ -232,20 +232,43 @@ async function fetchViaWebPage(
     if (YOUTUBE_COOKIE) headers['Cookie'] = YOUTUBE_COOKIE;
 
     const resp = await fetch(`https://www.youtube.com/watch?v=${videoId}`, { headers });
+    trace.push(`WebPage HTTP status: ${resp.status}`);
     if (!resp.ok) return null;
 
     const html = await resp.text();
-    const captionMatch = html.match(/"captionTracks":\s*(\[.*?\])/);
-    if (captionMatch) {
-      const tracks: CaptionTrack[] = JSON.parse(captionMatch[1]);
-      if (tracks.length > 0) {
-        const track = selectBestTrack(tracks, preferredLang);
-        const events = await fetchCaptionFile(track.baseUrl);
-        if (events && events.length > 0) {
-          return { events, language: track.languageCode };
-        }
+
+    let tracks: CaptionTrack[] = [];
+    const playerResponseMatch = html.match(/ytInitialPlayerResponse\s*=\s*({.+?});(?:var\s+meta|<\/script>)/s) ||
+                                html.match(/ytInitialPlayerResponse\s*=\s*({.+?});/s);
+
+    if (playerResponseMatch) {
+      try {
+        const playerResponse = JSON.parse(playerResponseMatch[1]);
+        tracks = playerResponse?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
+        trace.push(`WebPage ytInitialPlayerResponse tracks found: ${tracks.length}`);
+      } catch {
+        trace.push('Failed to parse ytInitialPlayerResponse JSON');
       }
     }
+
+    if (tracks.length === 0) {
+      const captionMatch = html.match(/"captionTracks":\s*(\[.*?\])/);
+      if (captionMatch) {
+        try {
+          tracks = JSON.parse(captionMatch[1]);
+          trace.push(`WebPage regex tracks found: ${tracks.length}`);
+        } catch {}
+      }
+    }
+
+    if (tracks.length > 0) {
+      const track = selectBestTrack(tracks, preferredLang);
+      const events = await fetchCaptionFile(track.baseUrl);
+      if (events && events.length > 0) {
+        return { events, language: track.languageCode };
+      }
+    }
+
     return null;
   } catch (err: unknown) {
     trace.push(`WebPage exception: ${err instanceof Error ? err.message : String(err)}`);
