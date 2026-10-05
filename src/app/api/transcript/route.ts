@@ -32,15 +32,19 @@ const ANDROID_UA = 'com.google.android.youtube/20.10.38 (Linux; U; Android 14)';
 const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 const INNERTUBE_API_URL = 'https://www.youtube.com/youtubei/v1/player?prettyPrint=false&key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8';
 
-// 1. Fetch visitorData token from YouTube homepage
+// Cookie environment variable
+const YOUTUBE_COOKIE = process.env.YOUTUBE_COOKIE || '';
+
+// 1. Fetch visitorData with Cookie support
 async function getVisitorData(): Promise<string | null> {
   try {
-    const resp = await fetch('https://www.youtube.com/', {
-      headers: {
-        'User-Agent': BROWSER_UA,
-        'Accept-Language': 'en-US,en;q=0.9',
-      },
-    });
+    const headers: Record<string, string> = {
+      'User-Agent': BROWSER_UA,
+      'Accept-Language': 'en-US,en;q=0.9',
+    };
+    if (YOUTUBE_COOKIE) headers['Cookie'] = YOUTUBE_COOKIE;
+
+    const resp = await fetch('https://www.youtube.com/', { headers });
     if (!resp.ok) return null;
     const html = await resp.text();
     const match = html.match(/"visitorData":"([^"]+)"/);
@@ -63,7 +67,7 @@ function decodeEntities(str: string): string {
     .replace(/&#(\d+);/g, (_, dec) => String.fromCodePoint(parseInt(dec, 10)));
 }
 
-// 3. Extract YouTube video ID
+// 3. Extract Video ID
 export function extractYouTubeVideoId(url: string): string | null {
   if (!url) return null;
   const trimmed = url.trim();
@@ -74,7 +78,7 @@ export function extractYouTubeVideoId(url: string): string | null {
   return match && match[1].length === 11 ? match[1] : null;
 }
 
-// 4. Format timestamp [MM:SS] or [HH:MM:SS]
+// 4. Timestamp formatting
 function formatTimestamp(ms: number): string {
   const s = Math.max(0, Math.floor(ms / 1000));
   const h = Math.floor(s / 3600);
@@ -86,7 +90,7 @@ function formatTimestamp(ms: number): string {
   return `${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
 }
 
-// 5. Select caption track
+// 5. Select Caption Track
 function selectBestTrack(tracks: CaptionTrack[], preferredLang?: string): CaptionTrack {
   if (preferredLang) {
     const direct = tracks.find((t) => t.languageCode.toLowerCase().startsWith(preferredLang.toLowerCase()));
@@ -101,7 +105,7 @@ function selectBestTrack(tracks: CaptionTrack[], preferredLang?: string): Captio
   return pool[0];
 }
 
-// 6. Parse XML caption responses
+// 6. Parse XML Caption Format
 function parseXmlEvents(xml: string): Json3Event[] {
   const events: Json3Event[] = [];
   const pRe = /<p\s+t="(\d+)"\s+d="(\d+)"[^>]*>([\s\S]*?)<\/p>/g;
@@ -120,7 +124,7 @@ function parseXmlEvents(xml: string): Json3Event[] {
   return events;
 }
 
-// 7. Fetch caption file
+// 7. Fetch Caption File
 async function fetchCaptionFile(baseUrl: string): Promise<Json3Event[] | null> {
   const urls = (() => {
     try {
@@ -132,9 +136,12 @@ async function fetchCaptionFile(baseUrl: string): Promise<Json3Event[] | null> {
     }
   })();
 
+  const headers: Record<string, string> = { 'User-Agent': ANDROID_UA };
+  if (YOUTUBE_COOKIE) headers['Cookie'] = YOUTUBE_COOKIE;
+
   for (const url of urls) {
     try {
-      const resp = await fetch(url, { headers: { 'User-Agent': ANDROID_UA } });
+      const resp = await fetch(url, { headers });
       if (!resp.ok) continue;
       const text = await resp.text();
       if (!text.trim()) continue;
@@ -151,7 +158,7 @@ async function fetchCaptionFile(baseUrl: string): Promise<Json3Event[] | null> {
   return null;
 }
 
-// 8. Fetch InnerTube
+// 8. Fetch via InnerTube (Supports embedded TVHTML5, Android, and Web clients with Cookie support)
 async function fetchViaInnerTube(
   videoId: string,
   preferredLang: string | undefined,
@@ -161,41 +168,48 @@ async function fetchViaInnerTube(
     const visitorData = await getVisitorData();
     trace.push(`visitorData: ${visitorData ? 'obtained' : 'unavailable'}`);
 
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-      'User-Agent': ANDROID_UA,
-    };
-    if (visitorData) headers['X-Goog-Visitor-Id'] = visitorData;
+    const clients = [
+      { clientName: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER', clientVersion: '2.0', ua: BROWSER_UA },
+      { clientName: 'ANDROID', clientVersion: '20.10.38', ua: ANDROID_UA },
+      { clientName: 'WEB', clientVersion: '2.20240308.00.00', ua: BROWSER_UA },
+    ];
 
-    const body: Record<string, unknown> = {
-      context: {
-        client: {
-          clientName: 'ANDROID',
-          clientVersion: '20.10.38',
-          hl: 'en',
-          gl: 'US',
-          ...(visitorData ? { visitorData } : {}),
+    for (const client of clients) {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        'User-Agent': client.ua,
+      };
+      if (visitorData) headers['X-Goog-Visitor-Id'] = visitorData;
+      if (YOUTUBE_COOKIE) headers['Cookie'] = YOUTUBE_COOKIE;
+
+      const body: Record<string, unknown> = {
+        context: {
+          client: {
+            clientName: client.clientName,
+            clientVersion: client.clientVersion,
+            hl: 'en',
+            gl: 'US',
+            ...(visitorData ? { visitorData } : {}),
+          },
         },
-      },
-      videoId,
-    };
+        videoId,
+      };
 
-    const resp = await fetch(INNERTUBE_API_URL, { method: 'POST', headers, body: JSON.stringify(body) });
-    trace.push(`InnerTube HTTP: ${resp.status}`);
-    if (!resp.ok) return null;
+      const resp = await fetch(INNERTUBE_API_URL, { method: 'POST', headers, body: JSON.stringify(body) });
+      trace.push(`InnerTube (${client.clientName}) HTTP: ${resp.status}`);
+      if (!resp.ok) continue;
 
-    const data = await resp.json();
-    const captionTracks = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks as CaptionTrack[] | undefined;
-    trace.push(`InnerTube tracks: ${captionTracks?.length ?? 0}`);
+      const data = await resp.json();
+      const captionTracks = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks as CaptionTrack[] | undefined;
+      trace.push(`InnerTube (${client.clientName}) tracks: ${captionTracks?.length ?? 0}`);
 
-    if (!captionTracks || captionTracks.length === 0) return null;
-
-    const track = selectBestTrack(captionTracks, preferredLang);
-    trace.push(`Selected track: ${track.languageCode} (${track.kind ?? 'manual'})`);
-
-    const events = await fetchCaptionFile(track.baseUrl);
-    if (events && events.length > 0) {
-      return { events, language: track.languageCode };
+      if (captionTracks && captionTracks.length > 0) {
+        const track = selectBestTrack(captionTracks, preferredLang);
+        const events = await fetchCaptionFile(track.baseUrl);
+        if (events && events.length > 0) {
+          return { events, language: track.languageCode };
+        }
+      }
     }
     return null;
   } catch (err: unknown) {
@@ -204,19 +218,20 @@ async function fetchViaInnerTube(
   }
 }
 
-// 9. Fetch WebPage
+// 9. Fetch via WebPage HTML match
 async function fetchViaWebPage(
   videoId: string,
   preferredLang: string | undefined,
   trace: string[]
 ): Promise<{ events: Json3Event[]; language: string } | null> {
   try {
-    const resp = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
-      headers: {
-        'User-Agent': BROWSER_UA,
-        'Accept-Language': 'en-US,en;q=0.9,hi;q=0.8',
-      },
-    });
+    const headers: Record<string, string> = {
+      'User-Agent': BROWSER_UA,
+      'Accept-Language': 'en-US,en;q=0.9,hi;q=0.8',
+    };
+    if (YOUTUBE_COOKIE) headers['Cookie'] = YOUTUBE_COOKIE;
+
+    const resp = await fetch(`https://www.youtube.com/watch?v=${videoId}`, { headers });
     if (!resp.ok) return null;
 
     const html = await resp.text();
@@ -238,7 +253,7 @@ async function fetchViaWebPage(
   }
 }
 
-// 10. Fetch Library
+// 10. Fetch via Library fallback
 async function fetchViaLibrary(
   videoId: string,
   preferredLang: string | undefined,
@@ -309,12 +324,10 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Invalid YouTube URL format.' }, { status: 400 });
     }
 
-    console.log(`Ingesting transcript for video: ${videoId}`);
-
     const isOpenAIKey = typeof apiKey === 'string' && (apiKey.startsWith('sk-') || apiKey.startsWith('sk-proj-'));
     const activeOpenAIKey = isOpenAIKey ? apiKey.trim() : process.env.OPENAI_API_KEY;
 
-    // ─── Caption Extraction Cascade ───
+    // Caption Extraction Cascade
     const trace: string[] = [];
     let captionResult: { events: Json3Event[]; language: string } | null = null;
 
@@ -333,7 +346,7 @@ export async function POST(request: Request) {
     const chunks = chunkEvents(captionResult.events, 800);
     const detectedLang = captionResult.language;
 
-    // ─── Vector Embeddings Generation ───
+    // Vector Embeddings Generation
     let embeddingsGenerated = false;
     let embeddingWarning: string | null = null;
 
@@ -351,11 +364,10 @@ export async function POST(request: Request) {
         embeddingsGenerated = true;
       } catch (e: unknown) {
         embeddingWarning = e instanceof Error ? e.message : 'Embedding generation failed';
-        console.warn('Embedding warning:', embeddingWarning);
       }
     }
 
-    // ─── Supabase Database Upsert ───
+    // Database Upsert
     await supabase.from('transcripts').delete().eq('video_id', videoId);
 
     const rows = chunks.map((c) => ({
@@ -372,21 +384,6 @@ export async function POST(request: Request) {
     for (let i = 0; i < rows.length; i += 100) {
       const { error } = await supabase.from('transcripts').insert(rows.slice(i, i + 100));
       if (error) { insertError = error; break; }
-    }
-
-    if (insertError && (insertError.message?.includes('start_ms') || insertError.message?.includes('end_ms'))) {
-      const legacyRows = chunks.map((c) => ({
-        video_id: videoId,
-        chunk_index: c.chunk_index,
-        chunk_text: c.chunk_text,
-        embedding: c.embedding || null,
-        updated_at: new Date().toISOString(),
-      }));
-      for (let i = 0; i < legacyRows.length; i += 100) {
-        const { error } = await supabase.from('transcripts').insert(legacyRows.slice(i, i + 100));
-        if (error) throw new Error(`Database error: ${error.message}`);
-      }
-      insertError = null;
     }
 
     if (insertError) {
