@@ -238,8 +238,9 @@ async function fetchViaWebPage(
     const html = await resp.text();
 
     let tracks: CaptionTrack[] = [];
-    const playerResponseMatch = html.match(/ytInitialPlayerResponse\s*=\s*({.+?});(?:var\s+meta|<\/script>)/s) ||
-                                html.match(/ytInitialPlayerResponse\s*=\s*({.+?});/s);
+    const playerResponseMatch = 
+      html.match(/ytInitialPlayerResponse\s*=\s*({[\s\S]+?});(?:var\s+meta|<\/script>)/) ||
+      html.match(/ytInitialPlayerResponse\s*=\s*({[\s\S]+?});/);
 
     if (playerResponseMatch) {
       try {
