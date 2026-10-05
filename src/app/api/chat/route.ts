@@ -1,3 +1,4 @@
+// src/app/api/chat/route.ts
 import { NextResponse } from 'next/server';
 import { supabase } from '@/lib/supabase';
 import OpenAI from 'openai';
@@ -14,52 +15,53 @@ export async function POST(request: Request) {
   try {
     if (!supabase) {
       console.error('Chat API Error: Supabase is not configured.');
-      return NextResponse.json({ error: 'Supabase is not configured.' }, { status: 500 });
+      return NextResponse.json({ error: 'Supabase is not configured on the server.' }, { status: 500 });
     }
 
     const body = await request.json();
-    const { message, videoId, apiKey, provider } = body;
+    const { message, videoId, apiKey, provider = 'auto' } = body;
 
     const trimmedKey = typeof apiKey === 'string' ? apiKey.trim() : '';
 
-    // Detect if key is OpenAI
+    // Provider Key Identifiers
     const isOpenAIKey = trimmedKey.startsWith('sk-') || trimmedKey.startsWith('sk-proj-');
+    const isGroqKey = trimmedKey.startsWith('gsk_');
     const openAIKey = isOpenAIKey ? trimmedKey : process.env.OPENAI_API_KEY;
 
-    // Detect active inference key (BYOK key or env key)
-    const activeApiKey = 
-      trimmedKey || 
-      process.env.HUGGINGFACE_API_KEY || 
-      process.env.HF_TOKEN || 
+    // Resolve Active Provider & Key
+    const activeApiKey =
+      trimmedKey ||
+      process.env.OPENAI_API_KEY ||
       process.env.GROQ_API_KEY ||
-      process.env.OPENAI_API_KEY;
-
-    console.log('Chat API Request received:', { videoId, messageLength: message?.length, hasCustomKey: !!trimmedKey });
+      process.env.HUGGINGFACE_API_KEY ||
+      process.env.HF_TOKEN ||
+      process.env.MISTRAL_API_KEY;
 
     if (!activeApiKey) {
-      return NextResponse.json({ 
-        error: 'Missing API Key. Please enter your API key in BYOK settings or configure it in server environment variables.' 
-      }, { status: 400 });
+      return NextResponse.json(
+        { error: 'Missing API key. Please enter your API key in settings or configure server environment variables.' },
+        { status: 400 }
+      );
     }
 
     if (!videoId) {
       return NextResponse.json({ error: 'Missing videoId in request.' }, { status: 400 });
     }
 
-    // Check if the user input is a casual greeting or pleasantry
+    // 1. Detect casual greetings or ultra-short messages
     const cleanMessage = message?.trim().toLowerCase() || '';
-    const greetings = ['hi', 'hello', 'hey', 'greetings', 'thanks', 'thank you', 'good morning', 'good evening', 'sup', 'bye'];
+    const greetings = ['hi', 'hello', 'hey', 'namaste', 'greetings', 'thanks', 'thank you', 'dhanyawad', 'good morning', 'good evening', 'sup', 'bye'];
     const isCasualChat = greetings.includes(cleanMessage) || cleanMessage.length <= 3;
 
     let transcriptContext = '';
     let relevanceScore: number | null = null;
     let matchedChunksCount = 0;
 
-    // Retrieve transcript chunks only if it is an actual content query
+    // 2. Vector Retrieval or Sequential Fallback
     if (!isCasualChat) {
       let matchedChunks: MatchedChunk[] = [];
 
-      // 1. Attempt Vector Similarity Search if OpenAI API key is available
+      // Attempt Vector Similarity Search if OpenAI Key exists (for embedding model)
       if (openAIKey) {
         try {
           const openai = new OpenAI({ apiKey: openAIKey });
@@ -70,11 +72,11 @@ export async function POST(request: Request) {
 
           const queryEmbedding = embRes.data[0].embedding;
 
-          // Call Postgres RPC match_video_transcripts
+          // Query Postgres vector function
           const { data: rpcMatches, error: rpcError } = await supabase.rpc('match_video_transcripts', {
             query_embedding: queryEmbedding,
             target_video_id: videoId,
-            match_threshold: 0.15,
+            match_threshold: 0.25, // Cosine similarity cutoff
             match_count: 8,
           });
 
@@ -83,26 +85,28 @@ export async function POST(request: Request) {
             const validSimilarities = rpcMatches
               .map((m: any) => m.similarity)
               .filter((s: any) => typeof s === 'number');
+
             if (validSimilarities.length > 0) {
-              relevanceScore = parseFloat((validSimilarities.reduce((a: number, b: number) => a + b, 0) / validSimilarities.length).toFixed(3));
+              relevanceScore = parseFloat(
+                (validSimilarities.reduce((a: number, b: number) => a + b, 0) / validSimilarities.length).toFixed(3)
+              );
             }
-            console.log(`Vector similarity search retrieved ${matchedChunks.length} chunks (Avg similarity: ${relevanceScore})`);
           } else if (rpcError) {
-            console.warn('match_video_transcripts RPC call returned error, falling back to sequential fetch:', rpcError.message);
+            console.warn('RPC vector match returned error, falling back to sequential fetch:', rpcError.message);
           }
         } catch (embErr) {
-          console.warn('Vector search attempt failed, falling back to standard fetch:', embErr);
+          console.warn('Vector search attempt failed, falling back to sequential fetch:', embErr);
         }
       }
 
-      // 2. Fallback: If vector search did not yield chunks, fetch transcript chunks sequentially
+      // Fallback: Fetch transcript chunks sequentially if vector match didn't return results
       if (matchedChunks.length === 0) {
         const { data: records, error: dbError } = await supabase
           .from('transcripts')
           .select('chunk_text')
           .eq('video_id', videoId)
           .order('chunk_index', { ascending: true })
-          .limit(20);
+          .limit(16);
 
         if (dbError) {
           console.error('Supabase fetch error:', dbError);
@@ -111,7 +115,6 @@ export async function POST(request: Request) {
 
         if (records && records.length > 0) {
           matchedChunks = records;
-          console.log(`Standard fetch loaded ${records.length} transcript chunks for context.`);
         }
       }
 
@@ -121,29 +124,26 @@ export async function POST(request: Request) {
       }
     }
 
-    // Define system instructions with timestamp citations and structured format
-    const systemContent = transcriptContext 
+    // 3. System Prompt Configuration
+    const systemContent = transcriptContext
       ? `You are an expert AI video analyst assistant. Answer the user's question based strictly on the provided YouTube video transcript context below.
 
-IMPORTANT RULES:
-- When referencing facts, cite the timestamp from the context (e.g. [02:45]).
-- If the user's question asks about something completely unrelated to the transcript or if the transcript doesn't contain the answer, politely inform them: "I couldn't find information about that in the current video transcript. Please ask a question related to the video's contents!"
+CRITICAL INSTRUCTIONS:
+1. Multi-Lingual Output: Respond in the exact language used in the user's question (e.g., English, Hindi, Marathi, or Hinglish).
+2. Timestamp Citations: Cite relevant timestamps directly from the text (e.g., [02:45] or [01:12:05]) whenever stating key points.
+3. Strict Grounding: If the question asks about topics completely absent from the context, state clearly in the user's language: "I couldn't find information about that in this video transcript. Please ask a question related to the video!"
 
-Format your response cleanly using this exact structure when applicable:
-- Provide a brief introductory paragraph summarizing the core answer with relevant timestamps.
-- Use bold headers for **Key Concepts** with brief bullet points.
-- Use bold headers for sub-categories (like **Types of ...**) if breaking down technical details.
+Format your output using clean Markdown with bold headers and bullet points where applicable.
 
 Transcript Context:
 ${transcriptContext}`
-      : `You are a friendly, helpful AI video companion assistant. Respond naturally and politely to the user's greeting, and let them know you're ready to answer questions about the currently loaded video!`;
+      : `You are a friendly, helpful AI video companion. Respond naturally to the user's greeting and invite them to ask any question about the loaded video!`;
 
-    // 3. Execute LLM Inference
-    // If the active key is an OpenAI key or Groq key, route appropriately, otherwise use Hugging Face router
+    // 4. LLM Inference Engine Routing
     let reply = '';
+    const targetProvider = provider !== 'auto' ? provider : isGroqKey ? 'groq' : isOpenAIKey ? 'openai' : 'huggingface';
 
-    if (isOpenAIKey || (provider === 'openai' && trimmedKey)) {
-      // Call OpenAI API
+    if (targetProvider === 'openai' || (isOpenAIKey && targetProvider === 'auto')) {
       const openai = new OpenAI({ apiKey: trimmedKey || process.env.OPENAI_API_KEY });
       const completion = await openai.chat.completions.create({
         model: 'gpt-4o-mini',
@@ -155,6 +155,50 @@ ${transcriptContext}`
         max_tokens: 1500,
       });
       reply = completion.choices[0]?.message?.content || '';
+    } else if (targetProvider === 'groq' || isGroqKey) {
+      const groqKey = isGroqKey ? trimmedKey : process.env.GROQ_API_KEY || trimmedKey;
+      const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${groqKey}`,
+        },
+        body: JSON.stringify({
+          model: 'llama-3.3-70b-versatile',
+          messages: [
+            { role: 'system', content: systemContent },
+            { role: 'user', content: message },
+          ],
+          temperature: 0.3,
+          max_tokens: 1500,
+        }),
+      });
+
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error?.message || 'Groq API request failed.');
+      reply = data.choices?.[0]?.message?.content || '';
+    } else if (targetProvider === 'mistral') {
+      const mistralKey = trimmedKey || process.env.MISTRAL_API_KEY || '';
+      const response = await fetch('https://api.mistral.ai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${mistralKey}`,
+        },
+        body: JSON.stringify({
+          model: 'mistral-small-latest',
+          messages: [
+            { role: 'system', content: systemContent },
+            { role: 'user', content: message },
+          ],
+          temperature: 0.3,
+          max_tokens: 1500,
+        }),
+      });
+
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error?.message || 'Mistral API request failed.');
+      reply = data.choices?.[0]?.message?.content || '';
     } else {
       // Default / Hugging Face Router API (DeepSeek-R1-Distill-Qwen-7B)
       const hfKey = trimmedKey || process.env.HUGGINGFACE_API_KEY || process.env.HF_TOKEN || '';
@@ -178,32 +222,25 @@ ${transcriptContext}`
       const data = await response.json();
 
       if (!response.ok) {
-        console.error('LLM Provider Error Response:', data);
         if (response.status === 401 || response.status === 403) {
-          return NextResponse.json({ 
-            error: 'Invalid API Key. Please verify your BYOK credentials and try again.' 
-          }, { status: 401 });
+          return NextResponse.json({ error: 'Invalid API Key. Please check your credentials.' }, { status: 401 });
         }
         if (response.status === 503) {
-          return NextResponse.json({ 
-            error: 'The AI model is currently loading into serverless memory. Please wait 10 seconds and try again.' 
-          }, { status: 503 });
+          return NextResponse.json(
+            { error: 'The AI model is currently initializing. Please try again in 10 seconds.' },
+            { status: 503 }
+          );
         }
-        throw new Error(data.error?.message || data.error || 'Provider inference failed.');
+        throw new Error(data.error?.message || data.error || 'Hugging Face inference failed.');
       }
 
-      const choice = data.choices?.[0];
-      const rawReply = choice?.message?.content || choice?.text || '';
-
-      // Clean DeepSeek-R1 <think> reasoning tokens
+      const rawReply = data.choices?.[0]?.message?.content || '';
       reply = rawReply.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
-      if (!reply) {
-        reply = rawReply.replace(/<\/?think>/g, '').trim();
-      }
+      if (!reply) reply = rawReply.replace(/<\/?think>/g, '').trim();
     }
 
     if (!reply) {
-      reply = "I processed your request, but could not produce a response. Please try rephrasing your question!";
+      reply = "I processed your request, but could not produce a response. Please try rephrasing your question.";
     }
 
     return NextResponse.json({
@@ -212,7 +249,6 @@ ${transcriptContext}`
       relevanceScore,
       matchedChunksCount,
     });
-
   } catch (err: unknown) {
     const errorMessage = err instanceof Error ? err.message : 'Unknown server error';
     console.error('Chat API Uncaught Exception:', errorMessage);
