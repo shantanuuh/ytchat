@@ -32,8 +32,7 @@ const ANDROID_UA = 'com.google.android.youtube/20.10.38 (Linux; U; Android 14)';
 const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 const INNERTUBE_API_URL = 'https://www.youtube.com/youtubei/v1/player?prettyPrint=false&key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8';
 
-// 1. Fetch a fresh visitorData token from the YouTube homepage.
-//    This is critical for Vercel/cloud IPs where YouTube returns LOGIN_REQUIRED without it.
+// 1. Fetch visitorData token from YouTube homepage
 async function getVisitorData(): Promise<string | null> {
   try {
     const resp = await fetch('https://www.youtube.com/', {
@@ -64,7 +63,7 @@ function decodeEntities(str: string): string {
     .replace(/&#(\d+);/g, (_, dec) => String.fromCodePoint(parseInt(dec, 10)));
 }
 
-// 3. Extract YouTube video ID from any URL format
+// 3. Extract YouTube video ID
 export function extractYouTubeVideoId(url: string): string | null {
   if (!url) return null;
   const trimmed = url.trim();
@@ -75,7 +74,7 @@ export function extractYouTubeVideoId(url: string): string | null {
   return match && match[1].length === 11 ? match[1] : null;
 }
 
-// 4. Format millisecond offset to [MM:SS] or [HH:MM:SS]
+// 4. Format timestamp [MM:SS] or [HH:MM:SS]
 function formatTimestamp(ms: number): string {
   const s = Math.max(0, Math.floor(ms / 1000));
   const h = Math.floor(s / 3600);
@@ -87,7 +86,7 @@ function formatTimestamp(ms: number): string {
   return `${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
 }
 
-// 5. Select the best caption track (prefer manual, then en > hi > mr > first)
+// 5. Select caption track
 function selectBestTrack(tracks: CaptionTrack[], preferredLang?: string): CaptionTrack {
   if (preferredLang) {
     const direct = tracks.find((t) => t.languageCode.toLowerCase().startsWith(preferredLang.toLowerCase()));
@@ -102,11 +101,9 @@ function selectBestTrack(tracks: CaptionTrack[], preferredLang?: string): Captio
   return pool[0];
 }
 
-// 6. Parse XML caption responses (srv3 or classic timedtext)
+// 6. Parse XML caption responses
 function parseXmlEvents(xml: string): Json3Event[] {
   const events: Json3Event[] = [];
-
-  // srv3: <p t="ms" d="ms">...</p>
   const pRe = /<p\s+t="(\d+)"\s+d="(\d+)"[^>]*>([\s\S]*?)<\/p>/g;
   let m;
   while ((m = pRe.exec(xml)) !== null) {
@@ -115,7 +112,6 @@ function parseXmlEvents(xml: string): Json3Event[] {
   }
   if (events.length > 0) return events;
 
-  // Classic: <text start="s" dur="s">...</text>
   const tRe = /<text\s+start="([\d.]+)"\s+dur="([\d.]+)"[^>]*>([\s\S]*?)<\/text>/g;
   while ((m = tRe.exec(xml)) !== null) {
     const raw = m[3].replace(/<[^>]+>/g, '').trim();
@@ -124,7 +120,7 @@ function parseXmlEvents(xml: string): Json3Event[] {
   return events;
 }
 
-// 7. Fetch the caption track file, trying json3 first then falling back to xml parse
+// 7. Fetch caption file
 async function fetchCaptionFile(baseUrl: string): Promise<Json3Event[] | null> {
   const urls = (() => {
     try {
@@ -150,21 +146,18 @@ async function fetchCaptionFile(baseUrl: string): Promise<Json3Event[] | null> {
         const xmlEvents = parseXmlEvents(text);
         if (xmlEvents.length > 0) return xmlEvents;
       }
-    } catch {
-      // Try next URL
-    }
+    } catch {}
   }
   return null;
 }
 
-// 8. Method 1: InnerTube API with visitor_data (works from Vercel/cloud IPs)
+// 8. Fetch InnerTube
 async function fetchViaInnerTube(
   videoId: string,
   preferredLang: string | undefined,
   trace: string[]
 ): Promise<{ events: Json3Event[]; language: string } | null> {
   try {
-    // Get fresh visitor_data first — this is the key to bypassing datacenter IP blocks
     const visitorData = await getVisitorData();
     trace.push(`visitorData: ${visitorData ? 'obtained' : 'unavailable'}`);
 
@@ -192,9 +185,8 @@ async function fetchViaInnerTube(
     if (!resp.ok) return null;
 
     const data = await resp.json();
-    const playability = data?.playabilityStatus?.status;
     const captionTracks = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks as CaptionTrack[] | undefined;
-    trace.push(`InnerTube playability: ${playability}, tracks: ${captionTracks?.length ?? 0}`);
+    trace.push(`InnerTube tracks: ${captionTracks?.length ?? 0}`);
 
     if (!captionTracks || captionTracks.length === 0) return null;
 
@@ -203,7 +195,6 @@ async function fetchViaInnerTube(
 
     const events = await fetchCaptionFile(track.baseUrl);
     if (events && events.length > 0) {
-      trace.push(`InnerTube: parsed ${events.length} events`);
       return { events, language: track.languageCode };
     }
     return null;
@@ -213,7 +204,7 @@ async function fetchViaInnerTube(
   }
 }
 
-// 9. Method 2: Web page HTML scraping with captionTracks regex
+// 9. Fetch WebPage
 async function fetchViaWebPage(
   videoId: string,
   preferredLang: string | undefined,
@@ -226,27 +217,20 @@ async function fetchViaWebPage(
         'Accept-Language': 'en-US,en;q=0.9,hi;q=0.8',
       },
     });
-    trace.push(`WebPage HTTP: ${resp.status}`);
     if (!resp.ok) return null;
 
     const html = await resp.text();
-
-    // Strategy A: captionTracks JSON array in page data
     const captionMatch = html.match(/"captionTracks":\s*(\[.*?\])/);
     if (captionMatch) {
       const tracks: CaptionTrack[] = JSON.parse(captionMatch[1]);
       if (tracks.length > 0) {
-        trace.push(`WebPage captionTracks: found ${tracks.length}`);
         const track = selectBestTrack(tracks, preferredLang);
         const events = await fetchCaptionFile(track.baseUrl);
         if (events && events.length > 0) {
-          trace.push(`WebPage: parsed ${events.length} events`);
           return { events, language: track.languageCode };
         }
       }
     }
-
-    trace.push('WebPage: captionTracks not found in HTML');
     return null;
   } catch (err: unknown) {
     trace.push(`WebPage exception: ${err instanceof Error ? err.message : String(err)}`);
@@ -254,7 +238,7 @@ async function fetchViaWebPage(
   }
 }
 
-// 10. Method 3: youtube-transcript library (last resort fallback)
+// 10. Fetch Library
 async function fetchViaLibrary(
   videoId: string,
   preferredLang: string | undefined,
@@ -262,11 +246,8 @@ async function fetchViaLibrary(
 ): Promise<{ events: Json3Event[]; language: string } | null> {
   try {
     const items = await YoutubeTranscript.fetchTranscript(videoId);
-    if (!items || items.length === 0) {
-      trace.push('youtube-transcript: empty result');
-      return null;
-    }
-    trace.push(`youtube-transcript: ${items.length} items (lang: ${items[0].lang ?? 'unknown'})`);
+    if (!items || items.length === 0) return null;
+
     const events: Json3Event[] = items.map((item) => ({
       tStartMs: Math.round(item.offset || 0),
       dDurationMs: Math.round(item.duration || 0),
@@ -279,7 +260,7 @@ async function fetchViaLibrary(
   }
 }
 
-// 11. Multilingual chunker (Devanagari + Latin sentence boundaries)
+// 11. Chunking with Devanagari + Latin boundaries
 function chunkEvents(events: Json3Event[], targetChars = 800): TranscriptChunk[] {
   const chunks: TranscriptChunk[] = [];
   let text = '';
@@ -325,9 +306,7 @@ export async function POST(request: Request) {
 
     const videoId = extractYouTubeVideoId(videoUrl);
     if (!videoId) {
-      return NextResponse.json({
-        error: 'Invalid YouTube URL. Please provide a valid link (e.g., youtube.com/watch?v=... or youtu.be/...)',
-      }, { status: 400 });
+      return NextResponse.json({ error: 'Invalid YouTube URL format.' }, { status: 400 });
     }
 
     console.log(`Ingesting transcript for video: ${videoId}`);
@@ -335,7 +314,7 @@ export async function POST(request: Request) {
     const isOpenAIKey = typeof apiKey === 'string' && (apiKey.startsWith('sk-') || apiKey.startsWith('sk-proj-'));
     const activeOpenAIKey = isOpenAIKey ? apiKey.trim() : process.env.OPENAI_API_KEY;
 
-    // ─── Caption Extraction (3 methods, cascade fallback) ───────────────────
+    // ─── Caption Extraction Cascade ───
     const trace: string[] = [];
     let captionResult: { events: Json3Event[]; language: string } | null = null;
 
@@ -344,19 +323,17 @@ export async function POST(request: Request) {
     if (!captionResult) captionResult = await fetchViaLibrary(videoId, lang, trace);
 
     if (!captionResult || captionResult.events.length === 0) {
-      console.warn('All extraction methods failed:', trace);
+      console.warn('All native extraction methods failed:', trace);
       return NextResponse.json({
-        error: 'Could not retrieve captions for this video. It may be private, live, or have captions disabled.',
+        error: 'Could not retrieve captions for this video. Captions may be disabled or video is private.',
         trace,
       }, { status: 400 });
     }
 
     const chunks = chunkEvents(captionResult.events, 800);
     const detectedLang = captionResult.language;
-    trace.push(`Produced ${chunks.length} chunks (lang: ${detectedLang})`);
-    console.log(trace.join(' | '));
 
-    // ─── Vector Embeddings (non-blocking) ───────────────────────────────────
+    // ─── Vector Embeddings Generation ───
     let embeddingsGenerated = false;
     let embeddingWarning: string | null = null;
 
@@ -378,7 +355,7 @@ export async function POST(request: Request) {
       }
     }
 
-    // ─── Supabase Upsert ────────────────────────────────────────────────────
+    // ─── Supabase Database Upsert ───
     await supabase.from('transcripts').delete().eq('video_id', videoId);
 
     const rows = chunks.map((c) => ({
@@ -397,7 +374,6 @@ export async function POST(request: Request) {
       if (error) { insertError = error; break; }
     }
 
-    // Backward-compat fallback: if start_ms / end_ms columns don't exist yet
     if (insertError && (insertError.message?.includes('start_ms') || insertError.message?.includes('end_ms'))) {
       const legacyRows = chunks.map((c) => ({
         video_id: videoId,
@@ -430,7 +406,6 @@ export async function POST(request: Request) {
     });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : 'Unknown error';
-    console.error('Transcript API error:', msg);
     return NextResponse.json({ error: msg }, { status: 500 });
   }
 }
